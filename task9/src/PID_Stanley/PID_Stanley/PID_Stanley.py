@@ -9,13 +9,14 @@ from nav_msgs.msg import Odometry
 #find the eufs specific frame
 import math
 import numpy as np
+import time
 
 waypoints = np.array(((4, 0.5), (6.0997, 0.46011999999999986), (8.958765, 0.6334599999999995), (12.904501, 0.5442049999999998), (16.50963, 0.9106499999999986), (20.142315, 2.0267799999999987), (23.03038, 3.0184499999999996), (25.728749999999998, 4.120899999999999), (27.0522, 3.8519499999999987), (29.24365, 3.0322499999999994), (30.2343, 2.159699999999999), (31.7488, 0.11077499999999851), (32.04075, -1.3419550000000005), (31.85275, -4.607830000000001), (30.93425, -7.440205000000001), (30.10215, -9.54865), (28.42945, -11.919970000000001), (26.178150000000002, -13.647795), (23.266765, -15.095735000000001), (20.758225, -16.539845), (16.424795, -18.711165), (12.720585, -20.563344999999998), (9.160635, -22.593), (6.340465, -24.4171), (3.4438549999999992, -25.2316), (2.0123599999999993, -24.977), (-0.24815000000000076, -23.59835), (-1.1382499999999993, -22.7739), (-3.0364499999999985, -20.334455), (-3.387450000000001, -16.96707), (-3.5478500000000004, -15.764190000000001), (-3.2800499999999992, -12.895075), (-2.8646499999999993, -10.3), (-2.565950000000001, -7.250210000000001), (-2.5943500000000004, -4.270505000000001), (-1.4700000000000006, -1.7200000000000006), (-0.6999999999999993, -0.6400000000000006), (0.5199999999999996, -0.26000000000000156)))
 
 class VehicleState(Node):
     def __init__(self):
         super().__init__('Vehicle_State')
-       
+        
         self.publisher_ = self.create_publisher(AckermannDriveStamped, '/cmd', 10)
         self.subscription = self.create_subscription(Odometry,'/ground_truth/odom',self.odom_callback,10)
         
@@ -23,22 +24,29 @@ class VehicleState(Node):
         self.current_wp_idx=0
         self.next_wp_idx=1
         self.waypoints=waypoints
+        self.is_finished = False
+
+        # Lap Timer variables
+        self.lap_start_time = None
+        self.lap_finished_printed = False
 
         self.prev_error=0
         self.e_i=0
         self.e_d=0
         self.wheelbase=1.58
+        self.curvature=0
         
-        self.target_velocity=4
+        self.target_velocity=0
+        self.max_velocity=10.5
 
         # PID Constants
-        self.pid_kp = 0.3
-        self.pid_ki = 0.002
-        self.pid_kd = 0.15
+        self.pid_kp = 5
+        self.pid_ki = 0
+        self.pid_kd = 0.18
 
         # Stanley Constants
-        self.stanley_k = 0.7
-        self.stanley_ks = 0.3
+        self.stanley_k = 0.06
+        self.stanley_ks = 1.7
 
     def pid_control(self, error, e_i, e_d):
         return (self.pid_kp * error + (self.pid_ki * e_i) + (self.pid_kd * e_d))
@@ -46,20 +54,76 @@ class VehicleState(Node):
     def stanley_control(self, cross_track_error, heading_error, velocity):
         return (heading_error + math.atan2(self.stanley_k * cross_track_error, velocity + self.stanley_ks))
 
+    def get_curvature_feedforward(self):
+        # Indices for the 3 points
+        idx1 = self.current_wp_idx
+        idx2 = self.next_wp_idx
+        idx3 = (self.next_wp_idx + 1) % len(self.waypoints)
+
+        p1 = self.waypoints[idx1]
+        p2 = self.waypoints[idx2]
+        p3 = self.waypoints[idx3]
+
+        # Calculating triangle side lengths
+        a = np.linalg.norm(p2 - p3)
+        b = np.linalg.norm(p1 - p3)
+        c = np.linalg.norm(p1 - p2)
+
+        # Calculating Area using cross product method 
+        area = 0.5 * abs(p1[0]*(p2[1] - p3[1]) + p2[0]*(p3[1] - p1[1]) + p3[0]*(p1[1] - p2[1]))
+
+        # Calculating Radius of circumcircle: R = abc / 4*Area
+        if area < 1e-6:
+            self.curvature = 0
+            return 0.0
+            
+        R = (a * b * c) / (4 * area)
+        self.curvature=1/R
+        vec1 = p2 - p1
+        vec2 = p3 - p2
+        cross_prod = vec1[0]*vec2[1] - vec1[1]*vec2[0]
+        
+        # Calculating feedforward angle: atan(L / R)
+        feedforward = math.atan(self.wheelbase / R)
+
+        if cross_prod < 0:
+            feedforward = -feedforward
+
+        return feedforward
+
     def odom_callback(self,msg):
+        current_time=msg.header.stamp.sec+msg.header.stamp.nanosec *1e-9
+        
+        # Starting lap timer 
+        if self.lap_start_time is None:
+            self.lap_start_time = current_time
+
+        # If we have reached the end
+        if self.is_finished:
+            if not self.lap_finished_printed:
+                total_lap_time = current_time - self.lap_start_time
+                self.get_logger().info(f"Lap finished")
+                self.get_logger().info(f"Final Lap Time: {total_lap_time:.3f} seconds")
+                self.lap_finished_printed = True
+
+            drive_msg = AckermannDriveStamped()
+            drive_msg.drive.speed = 0.0
+            drive_msg.drive.acceleration = -10.0 
+            drive_msg.drive.jerk = 100.0 
+            drive_msg.drive.steering_angle = 0.0
+            self.publisher_.publish(drive_msg)
+            return
+
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         v_x=msg.twist.twist.linear.x
         q=msg.pose.pose.orientation
         current_heading=self.quaternion_to_euler(q.x,q.y,q.z,q.w)
 
-        current_time=msg.header.stamp.sec+msg.header.stamp.nanosec *1e-9
         dt=0
-
         if self.prev_time is not None:
             dt=current_time-self.prev_time
         
-
         if self.prev_time is None or dt <= 0:
             self.prev_time = current_time
             return
@@ -69,18 +133,8 @@ class VehicleState(Node):
         # Updating Waypoints
         self.waypoint_calculator(x, y)
 
-        # PID Calculation 
-        error=self.target_velocity-v_x
-        self.e_i+=error*dt
-        self.e_i=np.clip(self.e_i,-5,5)
-        if(dt>0):
-            self.e_d=(error-self.prev_error)/dt
-        else:
-            self.e_d=0
-        self.prev_error=error
-        
-        # PID control value
-        accel_cmd = self.pid_control(error, self.e_i, self.e_d)
+        if self.is_finished:
+            return
 
         # Stanley Calculation
         xf = x+(self.wheelbase)*math.cos(current_heading)
@@ -101,28 +155,39 @@ class VehicleState(Node):
         # Cross track error calculation
         cross_track_error = np.cross(AP, AB) / np.linalg.norm(AB)
         
-        # Stanley control value
-        steering_cmd = self.stanley_control(cross_track_error, heading_error, v_x)
+        # Calculate Feedforward term 
+        steer_feedforward = self.get_curvature_feedforward()
 
-        # debugging
-        # Clamping steering to 50 degrees 
-        max_steer = 0.50
+        v_limit = math.sqrt(9.5/ abs(self.curvature))
+        self.target_velocity=min(self.max_velocity,v_limit)
+        # Stanley control value
+        steering_cmd = self.stanley_control(cross_track_error, heading_error, self.target_velocity) +steer_feedforward
+
+        # Clamping steering
+        max_steer = 0.4
         steering_cmd = np.clip(steering_cmd, -max_steer, max_steer)
 
         self.get_logger().info(
-            f"CTE: {cross_track_error:.3f} | "
-            f"HeadErr: {heading_error:.3f} | "
-            f"Steer: {steering_cmd:.3f} | "
-            f"PID_error: {error:.4f}"
+            f"WP: {self.current_wp_idx} | Lap Time: {current_time - self.lap_start_time:.2f}s | "
+            f"CTE: {cross_track_error:.2f} | Speed: {v_x:.2f}"
         )
-       
-   
+        
+        # PID Calculation 
+        error=(self.target_velocity)-v_x
+        self.e_i+=error*dt
+        self.e_i=np.clip(self.e_i,-5,5)
+        if(dt>0):
+            self.e_d=(error-self.prev_error)/dt
+        else:
+            self.e_d=0
+        self.prev_error=error
+        
+        # PID control value
+        accel_cmd = self.pid_control(error, self.e_i, self.e_d)
+
         drive_msg = AckermannDriveStamped()
-        
-	
-        drive_msg.drive.speed = float(self.target_velocity*math.cos(heading_error)) 
+        drive_msg.drive.speed = float((self.target_velocity)) 
         drive_msg.drive.acceleration = float(accel_cmd)
-        
         drive_msg.drive.steering_angle = float(steering_cmd)
         self.publisher_.publish(drive_msg)
 
@@ -138,13 +203,12 @@ class VehicleState(Node):
         if(np.dot(vector_path,vector_car)>0):
             return (self.waypoints[self.current_wp_idx])
         else:
+            if self.next_wp_idx == len(self.waypoints) - 1:
+                self.is_finished = True
+                return self.waypoints[self.current_wp_idx]
+
             self.current_wp_idx = (self.current_wp_idx + 1) % len(self.waypoints)
             self.next_wp_idx = (self.next_wp_idx + 1) % len(self.waypoints)
-            
-           
-            self.get_logger().info(f"Waypoint set to {self.current_wp_idx}")
-   
-            
             return (self.waypoints[self.current_wp_idx])
 
 def main(args=None):
@@ -156,4 +220,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
